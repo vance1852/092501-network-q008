@@ -8,17 +8,24 @@ from typing import Iterator
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(user_id TEXT PRIMARY KEY,role TEXT NOT NULL,salt TEXT NOT NULL,password_hash TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,user_id TEXT NOT NULL,expires_at TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1);
-CREATE TABLE IF NOT EXISTS segments(segment_id TEXT PRIMARY KEY,district TEXT NOT NULL,network_type TEXT NOT NULL,length_m REAL NOT NULL,criticality INTEGER NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS segments(segment_id TEXT PRIMARY KEY,district TEXT NOT NULL,network_type TEXT NOT NULL,length_m REAL NOT NULL,criticality INTEGER NOT NULL,status TEXT NOT NULL,installed_year INTEGER,material TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS readings(reading_id TEXT PRIMARY KEY,segment_id TEXT NOT NULL REFERENCES segments(segment_id),sensor_id TEXT NOT NULL,pressure_kpa REAL NOT NULL,flow_lps REAL NOT NULL,acoustic_db REAL NOT NULL,observed_at TEXT NOT NULL,UNIQUE(segment_id,sensor_id,observed_at));
 CREATE TABLE IF NOT EXISTS alerts(alert_id TEXT PRIMARY KEY,segment_id TEXT NOT NULL REFERENCES segments(segment_id),fingerprint TEXT NOT NULL UNIQUE,severity TEXT NOT NULL,score REAL NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,resolved_at TEXT);
 CREATE TABLE IF NOT EXISTS work_orders(work_order_id TEXT PRIMARY KEY,segment_id TEXT NOT NULL,alert_id TEXT NOT NULL,assignee TEXT NOT NULL,status TEXT NOT NULL,priority INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resources(resource_id TEXT PRIMARY KEY,kind TEXT NOT NULL,district TEXT NOT NULL,capacity INTEGER NOT NULL,available INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS allocations(allocation_id TEXT PRIMARY KEY,resource_id TEXT NOT NULL,work_order_id TEXT NOT NULL,quantity INTEGER NOT NULL,created_at TEXT NOT NULL,UNIQUE(resource_id,work_order_id));
 CREATE TABLE IF NOT EXISTS audit_events(event_id INTEGER PRIMARY KEY AUTOINCREMENT,entity_type TEXT NOT NULL,entity_id TEXT NOT NULL,action TEXT NOT NULL,actor TEXT NOT NULL,payload TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS health_rules(rule_version TEXT PRIMARY KEY,effective_from TEXT NOT NULL,config TEXT NOT NULL,fingerprint TEXT NOT NULL,status TEXT NOT NULL,created_by TEXT NOT NULL,created_at TEXT NOT NULL,published_at TEXT);
+CREATE TABLE IF NOT EXISTS health_reports(report_id TEXT PRIMARY KEY,name TEXT NOT NULL,as_of TEXT NOT NULL,rule_version TEXT NOT NULL,rule_fingerprint TEXT NOT NULL,input_fingerprint TEXT NOT NULL,params TEXT NOT NULL,summary TEXT NOT NULL,generated_by TEXT NOT NULL,generated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS health_report_entries(report_id TEXT NOT NULL REFERENCES health_reports(report_id),segment_id TEXT NOT NULL,district TEXT NOT NULL,health_index REAL NOT NULL,risk_score REAL NOT NULL,risk_band TEXT NOT NULL,contributions TEXT NOT NULL,factors TEXT NOT NULL,uncertain INTEGER NOT NULL,uncertainty_reasons TEXT NOT NULL,rank INTEGER,reading_ids TEXT NOT NULL,work_order_ids TEXT NOT NULL,PRIMARY KEY(report_id,segment_id));
 """
 def utcnow() -> str: return datetime.now(timezone.utc).isoformat()
+def _migrate(db: sqlite3.Connection) -> None:
+    columns={row[1] for row in db.execute("PRAGMA table_info(segments)")}
+    if "installed_year" not in columns: db.execute("ALTER TABLE segments ADD COLUMN installed_year INTEGER")
+    if "material" not in columns: db.execute("ALTER TABLE segments ADD COLUMN material TEXT NOT NULL DEFAULT ''")
 def connect(path: str = ":memory:") -> sqlite3.Connection:
-    db=sqlite3.connect(path,timeout=10); db.row_factory=sqlite3.Row; db.execute("PRAGMA foreign_keys=ON"); db.execute("PRAGMA journal_mode=WAL"); db.executescript(SCHEMA); db.commit(); return db
+    db=sqlite3.connect(path,timeout=10); db.row_factory=sqlite3.Row; db.execute("PRAGMA foreign_keys=ON"); db.execute("PRAGMA journal_mode=WAL"); db.executescript(SCHEMA); _migrate(db); db.commit(); return db
 @contextmanager
 def transaction(db: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     try: db.execute("BEGIN IMMEDIATE"); yield db; db.commit()

@@ -1,8 +1,10 @@
 """协调管网监测、告警、工单和应急资源分配的应用服务。"""
 from __future__ import annotations
-import hashlib,uuid
+import hashlib,json,uuid
+from datetime import timedelta
 from .auth import Auth
-from .models import Reading,Segment,as_dict,utcnow
+from .health import HealthRule,assign_ranks,canonical_json,compute_entry,fingerprint,rule_config_dict
+from .models import Reading,Segment,as_dict,parse_time,utcnow
 from .risk import leak_probability,score_reading
 from .storage import audit,connect,rows,transaction
 class NetworkService:
@@ -14,7 +16,7 @@ class NetworkService:
     def register_segment(self,token,segment):
         actor=self.auth.require(token,"admin"); segment.validate(); now=utcnow()
         with transaction(self.db):
-            self.db.execute("INSERT INTO segments VALUES(?,?,?,?,?,?,?,?)",(segment.segment_id,segment.district,segment.network_type,segment.length_m,segment.criticality,segment.status,now,now)); audit(self.db,"segment",segment.segment_id,"created",actor.user_id,as_dict(segment))
+            self.db.execute("INSERT INTO segments(segment_id,district,network_type,length_m,criticality,status,installed_year,material,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(segment.segment_id,segment.district,segment.network_type,segment.length_m,segment.criticality,segment.status,segment.installed_year,segment.material,now,now)); audit(self.db,"segment",segment.segment_id,"created",actor.user_id,as_dict(segment))
         return self.segment(token,segment.segment_id)
     def segment(self,token,segment_id):
         self.auth.require(token,"read"); row=self.db.execute("SELECT * FROM segments WHERE segment_id=?",(segment_id,)).fetchone()
@@ -76,3 +78,84 @@ class NetworkService:
             self.db.execute("INSERT INTO allocations VALUES(?,?,?,?,?)",(aid,resource_id,work_order_id,quantity,utcnow())); self.db.execute("UPDATE resources SET available=available-? WHERE resource_id=?",(quantity,resource_id)); audit(self.db,"resource",resource_id,"allocated",actor.user_id,{"work_order_id":work_order_id,"quantity":quantity})
         return {"allocation_id":aid,"duplicate":False,"resource_id":resource_id,"quantity":quantity}
     def audit_events(self,token,entity_type,entity_id): self.auth.require(token,"read"); return rows(self.db,"SELECT * FROM audit_events WHERE entity_type=? AND entity_id=? ORDER BY event_id",(entity_type,entity_id))
+    def create_health_rule(self,token,rule):
+        actor=self.auth.require(token,"approve"); rule.validate()
+        config=rule_config_dict(rule); config["effective_from"]=parse_time(rule.effective_from).isoformat()
+        with transaction(self.db):
+            if self.db.execute("SELECT 1 FROM health_rules WHERE rule_version=?",(rule.rule_version,)).fetchone(): raise ValueError("health rule version already exists")
+            self.db.execute("INSERT INTO health_rules VALUES(?,?,?,?,?,?,?,?)",(rule.rule_version,config["effective_from"],canonical_json(config),fingerprint(config),"draft",actor.user_id,utcnow(),None)); audit(self.db,"health_rule",rule.rule_version,"created",actor.user_id,config)
+        return self.health_rule(token,rule.rule_version)
+    def publish_health_rule(self,token,rule_version):
+        actor=self.auth.require(token,"approve")
+        with transaction(self.db):
+            row=self.db.execute("SELECT status FROM health_rules WHERE rule_version=?",(rule_version,)).fetchone()
+            if not row: raise KeyError(rule_version)
+            if row[0]!="draft": raise ValueError("only draft rules can be published")
+            self.db.execute("UPDATE health_rules SET status='published',published_at=? WHERE rule_version=?",(utcnow(),rule_version)); audit(self.db,"health_rule",rule_version,"published",actor.user_id,{})
+        return self.health_rule(token,rule_version)
+    def health_rule(self,token,rule_version):
+        self.auth.require(token,"read"); row=self.db.execute("SELECT * FROM health_rules WHERE rule_version=?",(rule_version,)).fetchone()
+        if not row: raise KeyError(rule_version)
+        return self._rule_dict(row)
+    def health_rules(self,token):
+        self.auth.require(token,"read"); return [self._rule_dict(r) for r in self.db.execute("SELECT * FROM health_rules ORDER BY effective_from,rule_version").fetchall()]
+    def generate_health_report(self,token,name,as_of=None,districts=None):
+        actor=self.auth.require(token,"analyze")
+        if not name or not name.strip(): raise ValueError("report name is required")
+        as_of=parse_time(as_of).isoformat() if as_of else utcnow(); as_of_dt=parse_time(as_of)
+        rule_row=self.db.execute("SELECT * FROM health_rules WHERE status='published' AND effective_from<=? ORDER BY effective_from DESC,rowid DESC LIMIT 1",(as_of,)).fetchone()
+        if not rule_row: raise ValueError("no published health rule is effective at the report time")
+        rule=HealthRule(**json.loads(rule_row["config"]))
+        if districts:
+            if not all(isinstance(d,str) and d.strip() for d in districts): raise ValueError("district filters are invalid")
+            marks=",".join("?" for _ in districts); segments=rows(self.db,f"SELECT * FROM segments WHERE district IN ({marks}) ORDER BY segment_id",sorted(set(districts)))
+        else: segments=rows(self.db,"SELECT * FROM segments ORDER BY segment_id")
+        entries=[]; segment_inputs=[]
+        for seg in segments:
+            readings=[r for r in rows(self.db,"SELECT * FROM readings WHERE segment_id=?",(seg["segment_id"],)) if parse_time(r["observed_at"])<=as_of_dt]
+            readings.sort(key=lambda r:(parse_time(r["observed_at"]),r["reading_id"]))
+            window_start=as_of_dt-timedelta(days=rule.repair_lookback_days)
+            orders=[o for o in rows(self.db,"SELECT * FROM work_orders WHERE segment_id=? AND status='completed'",(seg["segment_id"],)) if window_start<=parse_time(o["updated_at"])<=as_of_dt]
+            orders.sort(key=lambda o:o["work_order_id"])
+            entries.append(compute_entry(seg,readings,orders,rule,as_of))
+            segment_inputs.append({"segment":{k:seg[k] for k in ("segment_id","district","network_type","length_m","criticality","status","installed_year","material")},"readings":[[r["reading_id"],r["observed_at"],r["pressure_kpa"],r["flow_lps"],r["acoustic_db"]] for r in readings],"work_orders":[[o["work_order_id"],o["status"],o["updated_at"]] for o in orders]})
+        assign_ranks(entries)
+        report_id="hr-"+uuid.uuid4().hex[:16]
+        input_fp=fingerprint({"rule":json.loads(rule_row["config"]),"as_of":as_of,"segments":segment_inputs})
+        params={"districts":sorted(set(districts)) if districts else None}
+        summary={"segments":len(entries),"confident":sum(1 for e in entries if not e["uncertain"]),"uncertain":sum(1 for e in entries if e["uncertain"])}
+        with transaction(self.db):
+            self.db.execute("INSERT INTO health_reports VALUES(?,?,?,?,?,?,?,?,?,?)",(report_id,name.strip(),as_of,rule.rule_version,rule_row["fingerprint"],input_fp,canonical_json(params),canonical_json(summary),actor.user_id,utcnow()))
+            for e in entries:
+                self.db.execute("INSERT INTO health_report_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(report_id,e["segment_id"],e["district"],e["health_index"],e["risk_score"],e["risk_band"],canonical_json(e["contributions"]),canonical_json(e["factors"]),1 if e["uncertain"] else 0,json.dumps(e["uncertainty_reasons"],ensure_ascii=False),e["rank"],json.dumps(e["reading_ids"],ensure_ascii=False),json.dumps(e["work_order_ids"],ensure_ascii=False)))
+            audit(self.db,"health_report",report_id,"generated",actor.user_id,{"name":name.strip(),"as_of":as_of,"rule_version":rule.rule_version,"input_fingerprint":input_fp})
+        return self.health_report(token,report_id)
+    def health_reports(self,token):
+        self.auth.require(token,"read"); return [self._report_dict(r) for r in self.db.execute("SELECT * FROM health_reports ORDER BY generated_at DESC,report_id").fetchall()]
+    def health_report(self,token,report_id,district=None,risk_min=None,risk_max=None,uncertain=None):
+        self.auth.require(token,"read"); row=self.db.execute("SELECT * FROM health_reports WHERE report_id=?",(report_id,)).fetchone()
+        if not row: raise KeyError(report_id)
+        query="SELECT * FROM health_report_entries WHERE report_id=?"; args=[report_id]
+        if district: query+=" AND district=?"; args.append(district)
+        if risk_min is not None: query+=" AND risk_score>=?"; args.append(float(risk_min))
+        if risk_max is not None: query+=" AND risk_score<=?"; args.append(float(risk_max))
+        if uncertain is not None: query+=" AND uncertain=?"; args.append(1 if uncertain else 0)
+        query+=" ORDER BY rank IS NULL,rank,segment_id"
+        return {"report":self._report_dict(row),"entries":[self._entry_dict(r) for r in self.db.execute(query,args).fetchall()]}
+    def health_report_entry(self,token,report_id,segment_id):
+        self.auth.require(token,"read"); row=self.db.execute("SELECT * FROM health_report_entries WHERE report_id=? AND segment_id=?",(report_id,segment_id)).fetchone()
+        if not row: raise KeyError(f"{report_id}/{segment_id}")
+        entry=self._entry_dict(row)
+        return {"entry":entry,"readings":self._fetch_by_ids("readings","reading_id",entry["reading_ids"]),"work_orders":self._fetch_by_ids("work_orders","work_order_id",entry["work_order_ids"])}
+    def _fetch_by_ids(self,table,column,ids):
+        if not ids: return []
+        marks=",".join("?" for _ in ids); found={r[column]:dict(r) for r in self.db.execute(f"SELECT * FROM {table} WHERE {column} IN ({marks})",ids).fetchall()}
+        return [found[i] for i in ids if i in found]
+    def _rule_dict(self,row):
+        data=dict(row); data["config"]=json.loads(data["config"]); return data
+    def _report_dict(self,row):
+        data=dict(row); data["params"]=json.loads(data["params"]); data["summary"]=json.loads(data["summary"]); return data
+    def _entry_dict(self,row):
+        data=dict(row); data["uncertain"]=bool(data["uncertain"])
+        for key in ("contributions","factors","uncertainty_reasons","reading_ids","work_order_ids"): data[key]=json.loads(data[key])
+        return data

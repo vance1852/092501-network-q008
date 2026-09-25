@@ -14,10 +14,12 @@ def parse_time(value: str) -> datetime:
 @dataclass(frozen=True)
 class Segment:
     segment_id: str; district: str; network_type: str; length_m: float; criticality: int; status: str = "normal"
+    installed_year: int | None = None; material: str = ""
     def validate(self) -> None:
         if not self.segment_id.strip() or not self.district.strip(): raise ValueError("segment id and district are required")
         if self.network_type not in {"water", "drainage", "gas"}: raise ValueError("unsupported network type")
         if self.length_m <= 0 or not 1 <= self.criticality <= 5: raise ValueError("segment dimensions are invalid")
+        if self.installed_year is not None and not 1800 <= int(self.installed_year) <= datetime.now(timezone.utc).year + 1: raise ValueError("installed year is invalid")
 
 @dataclass(frozen=True)
 class Reading:
